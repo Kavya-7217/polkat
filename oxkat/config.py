@@ -60,7 +60,7 @@ BINDPATH = '$PWD,'+CWD+','+BIND
 IDIA_CONTAINER_PATH = ['/idia/software/containers/',HOME+'/containers/', CWD, HOME, '/software/astro/containers/polkat/']
 CHPC_CONTAINER_PATH = [HOME+'/containers/']
 HIPPO_CONTAINER_PATH = None
-NODE_CONTAINER_PATH = [HOME+'/containers/', CWD]
+NODE_CONTAINER_PATH = ['/fred/oz341/skavya/scripts/containers/', CWD]
 GLAM_CONTAINER_PATH = ['/mnt/users/hughesa', '/mnt/extraspace/thunderkat_pol', CWD]
 
 
