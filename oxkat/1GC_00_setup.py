@@ -26,6 +26,10 @@ bands = [(815e6,1080e6,'UHF'),
     (2406e6,3281e6,'S3'), # 2843.75
     (2625e6,3499e6,'S4')] # 3062.50 1653833475
 
+# Tags and nominal positions for the preferred primary calibrators
+PREFERRED_PRIMARY_CALS = [('1934',294.85427795833334,-63.71267375),
+    ('0408',62.084911833333344,-65.75252238888889)]
+
 
 def get_dummy():
 
@@ -147,6 +151,27 @@ def get_refant(master_ms,field_id):
     ranked_list = ','.join(ranked_list)
 
     return ranked_list
+
+
+def resolve_refant(ref_ant_str, ant_names):
+
+    """ Comma-separated refant list (antenna names and/or indices, either
+    mixed) -> the same list with every entry replaced by its antenna index.
+    The CASA calibration calls in this pipeline only reliably honour refant
+    as indices; a name that slips through leaves refant not actually set. """
+
+    resolved = []
+    for entry in ref_ant_str.split(','):
+        entry = entry.strip()
+        if entry.lstrip('-').isdigit():
+            resolved.append(entry)
+            continue
+        name = entry.lower()
+        if name not in ant_names:
+            raise ValueError("CAL_1GC_REF_ANT antenna '"+entry+"' not found in MS antenna list: "+str(ant_names))
+        resolved.append(str(ant_names.index(name)))
+
+    return ','.join(resolved)
 
 
 def get_nchan(master_ms):
@@ -361,10 +386,6 @@ def get_primary_tag(candidate_dirs,
     flux scale standards required in setjy for 0408 and everything else.
     """
 
-    # Tags and positions for the preferred primary calibrators
-    preferred_cals = [('1934',294.85427795833334,-63.71267375),
-        ('0408',62.084911833333344,-65.75252238888889)]
-
     primary_tag = ''
 
     for i in range(0,len(candidate_dirs)):
@@ -372,7 +393,7 @@ def get_primary_tag(candidate_dirs,
         candidate_name = candidate_names[i]
         candidate_id = candidate_ids[i]
 
-        for cal in preferred_cals:
+        for cal in PREFERRED_PRIMARY_CALS:
             primary_sep = calcsep(candidate_dir[0],candidate_dir[1],cal[1],cal[2])
             if primary_sep < 3e-3:
                 primary_name = candidate_name
@@ -396,12 +417,15 @@ def disambiguate_primary_candidates(master_ms,
                 pre_fields,
                 mylogger):
 
-    """ When multiple primary candidates exist, use PRE_FIELDS or scan counts to select one.
+    """ When multiple primary candidates exist, narrow them down to one.
 
-    Priority:
+    Priority, applied regardless of whether PRE_FIELDS is set:
       1. If PRE_FIELDS is set, filter to candidates whose name appears in it.
-      2. If PRE_FIELDS is empty, or no candidate matches PRE_FIELDS, pick the
-         candidate with the most scans (warns in the latter case).
+         If NONE match, this is a fatal misconfiguration: log an error and halt.
+      2. If more than one candidate remains, prefer one that positionally
+         matches a known standard calibrator (1934/0408).
+      3. Otherwise, pick the candidate with the most scans (ties broken by
+         whichever candidate comes first in the list).
     """
 
     if len(candidate_ids) <= 1:
@@ -418,15 +442,32 @@ def disambiguate_primary_candidates(master_ms,
                 matched_names.append(n)
                 matched_ids.append(i)
 
-        if matched_dirs:
-            mylogger.info(f'Selecting primary from PRE_FIELDS match: {list(zip(matched_ids, matched_names))}')
-            return matched_dirs, matched_names, matched_ids
+        if not matched_dirs:
+            mylogger.error(
+                f'PRE_FIELDS is set ("{pre_fields}") but none of the primary candidates '
+                f'({candidate_names}) appear in it. Add a primary to PRE_FIELDS and re-run.'
+            )
+            sys.exit(f'Ending Early! PRE_FIELDS ("{pre_fields}") matches none of the primary candidates {candidate_names}')
 
-        mylogger.warning(
-            f'PRE_FIELDS is set ("{pre_fields}") but none of the primary candidates '
-            f'({candidate_names}) appear in it. Add a primary to PRE_FIELDS and re-run. '
-            f'Falling back to most-scans selection.'
-        )
+        candidate_dirs, candidate_names, candidate_ids = matched_dirs, matched_names, matched_ids
+        mylogger.info(f'Selecting primary from PRE_FIELDS match: {list(zip(matched_ids, matched_names))}')
+
+    if len(candidate_ids) <= 1:
+        return candidate_dirs, candidate_names, candidate_ids
+
+    # Prefer a candidate that positionally matches a known standard calibrator (1934/0408)
+    preferred_matches = []
+    for d, n, i in zip(candidate_dirs, candidate_names, candidate_ids):
+        field_dir = d[0]
+        for tag, ra, dec in PREFERRED_PRIMARY_CALS:
+            if calcsep(field_dir[0], field_dir[1], ra, dec) < 3e-3:
+                preferred_matches.append((d, n, i, tag))
+                break
+
+    if len(preferred_matches) == 1:
+        d, n, i, tag = preferred_matches[0]
+        mylogger.info(f'Auto-selecting preferred calibrator {i}: {n} ({tag}) among multiple candidates')
+        return [d], [n], [i]
 
     # Fallback: count scans per candidate and pick the one with the most
     main_tab = table(master_ms, ack=False)
@@ -765,7 +806,7 @@ def main():
         ref_ant = get_refant(master_ms,primary_id)
         mylogger.info('Ranked reference antenna ordering: '+str(ref_ant))
     else:
-        ref_ant = CAL_1GC_REF_ANT
+        ref_ant = resolve_refant(CAL_1GC_REF_ANT, get_antnames(master_ms))
         mylogger.info('User requested reference antenna ordering: '+str(ref_ant))
 
 

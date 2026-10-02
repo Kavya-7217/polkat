@@ -19,6 +19,15 @@ SET_REFANT       = True
 ADAPTIVE_CHANNELS = True
 DO_DD_SELFCAL    = False
 
+# Path to the QuartiCal YAML for direction-dependent selfcal (used when
+# DO_DD_SELFCAL=True). Should define G+dE (or equivalent DD) terms --
+# distinct from CAL_2GC_YAML_COMPLEX.
+CAL_DDECAL_YAML = cfg.DATA + '/quartical/2GC_complex_2dir.yaml'
+
+# Never True when CAL_1GC_APPLYPARANG is True — 1GC already puts CORRECTED_DATA
+# in the sky frame, so re-applying parang here would double-correct it.
+PARANGMODEL = cfg.CAL_2GC_PARANGMODEL and not cfg.CAL_1GC_APPLYPARANG
+
 
 def get_adaptive_freq_intervals(yaml_path, n_model_channels):
     """Parse a QuartiCal YAML and return (ratio, overrides, zeros, ok) where:
@@ -51,6 +60,17 @@ def main():
     print(gen.col()+'2GC (TRICOLOR flagging, imaging & DI phase self-calibration) setup')
     gen.print_spacer()
 
+    # QuartiCal YAML(s) this run depends on must exist before any job is generated.
+    # Stage 1 always uses CAL_2GC_YAML; stage 2 uses the DD-selfcal YAML when
+    # DO_DD_SELFCAL is set, otherwise CAL_2GC_YAML_COMPLEX -- only ever one of
+    # the two, mirroring the branch each is actually used in below.
+    if not o.isfile(cfg.CAL_2GC_YAML):
+        sys.exit(gen.col('QuartiCal YAML')+f'CAL_2GC_YAML is set to {cfg.CAL_2GC_YAML}, which does not exist')
+    if DO_DD_SELFCAL:
+        if not o.isfile(CAL_DDECAL_YAML):
+            sys.exit(gen.col('QuartiCal YAML')+f'DO_DD_SELFCAL is True but {CAL_DDECAL_YAML} does not exist')
+    elif not o.isfile(cfg.CAL_2GC_YAML_COMPLEX):
+        sys.exit(gen.col('QuartiCal YAML')+f'CAL_2GC_YAML_COMPLEX is set to {cfg.CAL_2GC_YAML_COMPLEX}, which does not exist')
 
     # ------------------------------------------------------------------------------
     #
@@ -282,31 +302,47 @@ def main():
                 print(gen.col('Mask')+ 'None')
 
             else:
+                if not o.isfile(mask):
+                    sys.exit(gen.col('Mask')+f'WSC_MASK is set to {mask}, which does not exist')
                 print(gen.col('Mask')+mask)
 
             step = {}
             step['step'] = n
-            step['comment'] = 'Run wsclean, masked deconvolution of the DATA column for source {}'.format(targetname)
-            step['dependency'] = n - 1 
+            if PARANGMODEL:
+                step['comment'] = f'Parang-correct then run wsclean, masked deconvolution for source {targetname} (sky-frame model; DATA itself stays feed-frame)'
+            else:
+                step['comment'] = 'Run wsclean, masked deconvolution of the DATA column for source {}'.format(targetname)
+            step['dependency'] = n - 1
             step['id'] = 'WSDMA'+code
             step['slurm_config'] = cfg.SLURM_WSCLEAN
             step['pbs_config'] = cfg.PBS_WSCLEAN
             absmem = gen.absmem_helper(step,INFRASTRUCTURE,cfg.WSC_ABSMEM)
             syscall = ''
+            if PARANGMODEL:
+                # DATA is still feed-frame here; parang-correct into CORRECTED_DATA
+                # so the datamask model is built in the sky frame (avoids smearing
+                # polarised flux when this image is time-averaged), while leaving
+                # DATA itself untouched for the feed-frame QuartiCal solve below.
+                datamask_datacol = 'CORRECTED_DATA'
+                prefix_py = CONTAINER_RUNNER+PYTHON3_CONTAINER+' ' if USE_SINGULARITY else ''
+                syscall += prefix_py + f'python3 {TOOLS}/casa_correct_parang.py {myms}\n\n'
+            else:
+                datamask_datacol = 'DATA'
             prefix = CONTAINER_RUNNER+WSCLEAN_CONTAINER+' ' if USE_SINGULARITY else ''
             imcall = gen.generate_syscall_wsclean(mslist = [myms],
                     imgname = data_img_prefix,
                     mfweight = False,
-                    datacol = 'DATA',
+                    datacol = datamask_datacol,
                     mask = mask,
                     chanout = cfg.WSC_DMASK_CHANNELSOUT,
-                    intervalsout = False,
+                    # qu_autoscale = False,
+                    #intervalsout = False,
                     tukeytaper=tukeytaper,
                     minuvl = minuvl,
                     maxuvl = maxuvl,
                     automask = cfg.WSC_SHALLOWMASK,
-                    localrms = cfg.WSC_INTER_LOCALRMS,
-                    autothreshold = cfg.WSC_INTER_AUTOTHRESHOLD,
+                    localrms = cfg.WSC_SHALLOWMASK_LOCALRMS,
+                    autothreshold = cfg.WSC_SHALLOWMASK_AUTOTHRESHOLD,
                     nomodel = True,
                     sourcelist = False,
                     absmem = absmem)
@@ -360,6 +396,11 @@ def main():
             step['pbs_config'] = cfg.PBS_WSCLEAN
             syscall = CONTAINER_RUNNER + QUARTICAL_CONTAINER+' ' if USE_SINGULARITY else ''
             extra_args = f'output.gain_directory={gain_outdir_2GC} output.log_directory={log_outdir_2GC}'
+            if PARANGMODEL:
+                # DATA is feed-frame; MODEL_DATA is sky-frame (built from the
+                # parang-corrected WSDMA image) — forward-rotate the model to
+                # match. Do not derotate the output here; this isn't the final solve.
+                extra_args += ' input_model.apply_p_jones=true'
             if ref_ant_arg is not None:
                 extra_args += f' solver.reference_antenna={ref_ant_arg}'
             for term, _, new_fi in freq_int_overrides_stage1:
@@ -391,23 +432,36 @@ def main():
 
             step = {}
             step['step'] = n
-            step['comment'] = f'Run wsclean, masked deconvolution of the CORRECTED_DATA (self-calibrated, stage 1) for {targetname}'
+            if PARANGMODEL:
+                step['comment'] = f'Parang-correct then run wsclean, masked deconvolution of the stage-1 self-calibrated data for {targetname} (sky-frame model; stage2_ms DATA stays feed-frame)'
+            else:
+                step['comment'] = f'Run wsclean, masked deconvolution of the CORRECTED_DATA (self-calibrated, stage 1) for {targetname}'
             step['dependency'] = n - 1
             step['id'] = 'WSCMI'+code
             step['slurm_config'] = cfg.SLURM_WSCLEAN
             step['pbs_config'] = cfg.PBS_WSCLEAN
             absmem = gen.absmem_helper(step,INFRASTRUCTURE,cfg.WSC_ABSMEM)
             syscall = ''
+            if PARANGMODEL:
+                # stage2_ms DATA (split from the stage-1 solve) is still feed-frame;
+                # parang-correct into CORRECTED_DATA so the inter model is built in
+                # the sky frame, leaving stage2_ms DATA untouched for the stage-2
+                # amplitude solve below.
+                inter_datacol = 'CORRECTED_DATA'
+                prefix_py = CONTAINER_RUNNER+PYTHON3_CONTAINER+' ' if USE_SINGULARITY else ''
+                syscall += prefix_py + f'python3 {TOOLS}/casa_correct_parang.py {stage2_ms}\n\n'
+            else:
+                inter_datacol = 'DATA'
             prefix = CONTAINER_RUNNER+WSCLEAN_CONTAINER+' ' if USE_SINGULARITY else ''
             imcall = gen.generate_syscall_wsclean(mslist = [stage2_ms],
                     imgname = inter_img_prefix,
-                    datacol = 'DATA',
+                    datacol = inter_datacol,
                     mask = mask,
                     chanout = cfg.WSC_DMASK_CHANNELSOUT,
                     tukeytaper=tukeytaper,
                     minuvl = minuvl,
                     maxuvl = maxuvl,
-                    qu_automask_scale = 1.0,
+                    # qu_automask_scale = 1.0,
                     localrms = cfg.WSC_INTER_LOCALRMS,
                     automask = cfg.WSC_INTER_AUTOMASK,
                     autothreshold = cfg.WSC_INTER_AUTOTHRESHOLD,
@@ -434,10 +488,6 @@ def main():
                 n += 1
 
             if DO_DD_SELFCAL:
-
-                # Path to the QuartiCal YAML for direction-dependent selfcal (used when DO_DD_SELFCAL=True).
-                # Should define G+dE (or equivalent DD) terms — distinct from CAL_2GC_YAML_COMPLEX.
-                CAL_DDECAL_YAML = DATA + '/quartical/2GC_complex_2dir.yaml'
 
                 # Direction-dependent selfcal block (mirrors 3GC_peel workflow).
                 # DIR.reg in the CWD defines the calibration direction to extract.
@@ -492,7 +542,11 @@ def main():
                 syscall = CONTAINER_RUNNER + QUARTICAL_CONTAINER+' ' if USE_SINGULARITY else ''
                 extra_args = (f'output.gain_directory={gain_outdir_stage2} output.log_directory={log_outdir_stage2}'
                               f' input_model.recipe={dd_recipe} output.subtract_directions={dd_subtract}')
+                if PARANGMODEL:
+                    # Forward-rotate the model to match feed-frame DATA.
+                    extra_args += ' input_model.apply_p_jones=true'
                 if not cfg.CAL_1GC_APPLYPARANG:
+                    # Last solve: derotate CORRECTED_DATA back to the sky frame.
                     extra_args += ' output.apply_p_jones_inv=true'
                 if ref_ant_arg is not None:
                     extra_args += f' solver.reference_antenna={ref_ant_arg}'
@@ -534,7 +588,7 @@ def main():
 
                 step = {}
                 step['step'] = n
-                step['comment'] = 'Run Quartical amplitude self-calibration (stage 2) on the target {}'.format(targetname)
+                step['comment'] = 'Run Quartical refined self-calibration (stage 2) on the target {}'.format(targetname)
                 step['dependency'] = n - 1
                 step['id'] = 'CL2GC'+code
                 step['slurm_config'] = cfg.SLURM_WSCLEAN
@@ -545,8 +599,11 @@ def main():
                     extra_args += f' solver.reference_antenna={ref_ant_arg}'
                 for term, _, new_fi in freq_int_overrides_stage2:
                     extra_args += f' {term}.freq_interval={new_fi}'
+                if PARANGMODEL:
+                    # Forward-rotate the model to match feed-frame DATA.
+                    extra_args += ' input_model.apply_p_jones=true'
                 if not cfg.CAL_1GC_APPLYPARANG:
-                    # Parang not applied in 1GC — apply it here as the final calibration step
+                    # Last solve: derotate CORRECTED_DATA back to the sky frame.
                     extra_args += ' output.apply_p_jones_inv=true'
                 if maxuvl != '' or minuvl != '':
                     extra_args += f' input_ms.select_uv_range=[{minuv_val},{maxuv_val}]'
@@ -579,6 +636,7 @@ def main():
                 syscall = prefix + (
                     f'python3 {TOOLS}/check_and_fix_parang_selfcal.py '
                     f'{log_outdir_stage2} {stage2_ms} "{fallback_qc_cmd}"'
+                    + (' --parangmodel' if PARANGMODEL else '')
                 )
                 step['syscall'] = syscall
                 steps.append(step)
@@ -599,6 +657,7 @@ def main():
                     datacol = 'CORRECTED_DATA',
                     mask = mask,
                     chanout = cfg.WSC_PCAL_CHANNELSOUT,
+                    #intervalsout = False,
                     nomodel=True,
                     sourcelist = False,
                     absmem = absmem)
@@ -667,13 +726,18 @@ def main():
 
             if cfg.WSC_POL != 'I':
 
+                # Only make Plin images
+                only_Plin = True
+                if project_info['polang_name'] == '':
+                    only_Plin = False
+
                 step = {}
                 step['step'] = n
                 step['comment'] = 'Make Polarization Intensity Images for '+targetname
                 step['dependency'] = n - 1
                 step['id'] = 'MKLPI'+code
                 syscall = CONTAINER_RUNNER+PYTHON3_CONTAINER+' ' if USE_SINGULARITY else ''
-                syscall += f"python3 {cfg.TOOLS}/make_pol_images.py {cfg.IMAGES} {targetname} True"
+                syscall += f"python3 {cfg.TOOLS}/make_pol_images.py {cfg.IMAGES} {targetname} {only_Plin}"
                 step['syscall'] = syscall
                 steps.append(step)
                 n += 1
